@@ -284,8 +284,14 @@
      * @returns {string}
      */
     function getComponentBundleUrl() {
-        return ApiClient.getUrl(`/JellyfinEnhanced/bundle.js?v=${getScriptVersion()}`);
+        // The bootstrap's key names the bundle of this server's enabled features
+        // only; without it (no bootstrap) the full bundle, as before.
+        const key = componentBundleKey || getScriptVersion();
+        return ApiClient.getUrl(`/JellyfinEnhanced/bundle.js?v=${encodeURIComponent(key)}`);
     }
+
+    /** Set from the bootstrap payload's ComponentBundleKey before the bundle loads. */
+    let componentBundleKey = null;
 
     /**
      * Loads the translation module and exposes JE.loadTranslations.
@@ -1351,6 +1357,7 @@
             // them as one server-side bundle, dev mode as individual files.
             // Modules read JE.pluginConfig / JE.userConfig at eval time, so this
             // must stay after the config is applied.
+            componentBundleKey = bootstrap && typeof bootstrap.ComponentBundleKey === 'string' ? bootstrap.ComponentBundleKey : null;
             await loadComponentScripts(bootstrap ? bootstrap.ComponentScripts : null);
             console.log('🪼 Jellyfin Enhanced: All component scripts loaded.');
 
