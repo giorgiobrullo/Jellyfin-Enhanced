@@ -46,6 +46,7 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Services
     {
         private const string ResourcePrefix = "Jellyfin.Plugin.JellyfinEnhanced.js.";
         private const string ManifestResource = ResourcePrefix + "component-scripts.json";
+        private const string GatesResource = ResourcePrefix + "component-gates.json";
 
         // Manifest paths are interpolated into a block comment and a JS string
         // literal, so only plain relative paths are accepted.
@@ -53,7 +54,11 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Services
 
         private static readonly object _lock = new();
         private static string[]? _manifest;
-        private static (string CacheKey, byte[] Script, byte[] SourceMap)? _cached;
+        private static Dictionary<string, string>? _gates;
+        // One bundle per module set: the full one (the URL without a module-set key) and the one
+        // for the current configuration, plus the previous configuration's while clients move on.
+        private const int MaxCachedBundles = 3;
+        private static readonly List<(string CacheKey, bool Full, byte[] Script, byte[] SourceMap)> _cached = new();
 
         /// <summary>
         /// The ordered component-script paths (relative to js/), with the "//"
@@ -81,21 +86,103 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Services
         }
 
         /// <summary>
+        /// The gate of each module that is only needed for some features
+        /// (js/component-gates.json): a boolean expression over configuration
+        /// flags. Modules without an entry are always needed.
+        /// </summary>
+        internal static IReadOnlyDictionary<string, string> GetComponentGates()
+        {
+            var gates = _gates;
+            if (gates != null)
+            {
+                return gates;
+            }
+
+            gates = new Dictionary<string, string>(StringComparer.Ordinal);
+            using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(GatesResource);
+            if (stream != null)
+            {
+                var entries = JsonSerializer.Deserialize<Dictionary<string, string>>(stream) ?? new();
+                foreach (var (path, gate) in entries)
+                {
+                    if (!path.StartsWith("//", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(gate))
+                    {
+                        gates[path] = gate;
+                    }
+                }
+            }
+
+            _gates = gates;
+            return gates;
+        }
+
+        /// <summary>
+        /// The component scripts the given configuration needs: those without a
+        /// gate and those whose gate holds. A disabled feature's modules are
+        /// neither downloaded nor parsed nor run (about 2 of the bundle's 3 MB
+        /// belong to features a server may not use).
+        /// </summary>
+        /// <param name="flag">The value of a configuration flag; true for one it does not know.</param>
+        internal static IReadOnlyList<string> GetComponentScripts(Func<string, bool> flag)
+        {
+            var gates = GetComponentGates();
+            return GetComponentScripts()
+                .Where(path => !gates.TryGetValue(path, out var gate) || GateExpression.Evaluate(gate, flag))
+                .ToArray();
+        }
+
+        /// <summary>
+        /// The bundle URL's key for a module set: the plugin's cache key plus a
+        /// hash of the module list, so a configuration change gives a new URL and
+        /// the year-long browser cache never serves another set's bundle.
+        /// </summary>
+        internal static string GetBundleKey(string cacheKey, IReadOnlyList<string> scripts)
+        {
+            if (scripts.Count == GetComponentScripts().Count)
+            {
+                return cacheKey;
+            }
+
+            var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', scripts)));
+            return cacheKey + "-" + Convert.ToHexString(hash, 0, 6).ToLowerInvariant();
+        }
+
+        /// <summary>
         /// Returns the bundle script and its source map for the given cache key,
         /// building them on first use. <paramref name="rebuild"/> (dev mode)
         /// bypasses the process-lifetime cache.
         /// </summary>
         internal static (byte[] Script, byte[] SourceMap) GetBundle(string cacheKey, bool rebuild, Logger logger)
+            => GetBundle(cacheKey, GetComponentScripts(), rebuild, logger);
+
+        /// <summary>
+        /// Returns the bundle of the given module set under its key (see
+        /// <see cref="GetBundleKey"/>), building it on first use.
+        /// </summary>
+        internal static (byte[] Script, byte[] SourceMap) GetBundle(string bundleKey, IReadOnlyList<string> scripts, bool rebuild, Logger logger)
         {
             lock (_lock)
             {
-                if (!rebuild && _cached.HasValue && _cached.Value.CacheKey == cacheKey)
+                var index = _cached.FindIndex(c => c.CacheKey == bundleKey);
+                if (!rebuild && index >= 0)
                 {
-                    return (_cached.Value.Script, _cached.Value.SourceMap);
+                    return (_cached[index].Script, _cached[index].SourceMap);
                 }
 
-                var built = Build(cacheKey, logger);
-                _cached = (cacheKey, built.Script, built.SourceMap);
+                var built = Build(bundleKey, scripts, logger);
+                if (index >= 0)
+                {
+                    _cached.RemoveAt(index);
+                }
+
+                _cached.Add((bundleKey, scripts.Count == GetComponentScripts().Count, built.Script, built.SourceMap));
+                // The oldest trimmed set goes first; the full bundle stays (old clients ask for it).
+                while (_cached.Count > MaxCachedBundles)
+                {
+                    var oldest = _cached.FindIndex(c => !c.Full && c.CacheKey != bundleKey);
+                    _cached.RemoveAt(oldest >= 0 ? oldest : 0);
+                }
+
                 return built;
             }
         }
@@ -107,9 +194,8 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Services
             public int LineCount { get; init; }
         }
 
-        private static (byte[] Script, byte[] SourceMap) Build(string cacheKey, Logger logger)
+        private static (byte[] Script, byte[] SourceMap) Build(string cacheKey, IReadOnlyList<string> scripts, Logger logger)
         {
-            var scripts = GetComponentScripts();
             var assembly = Assembly.GetExecutingAssembly();
             var sb = new StringBuilder(2 * 1024 * 1024);
             var sections = new List<Section>(scripts.Count);

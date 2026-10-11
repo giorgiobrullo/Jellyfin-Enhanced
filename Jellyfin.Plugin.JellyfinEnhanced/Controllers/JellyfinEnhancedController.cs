@@ -3934,9 +3934,13 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Controllers
             var authorizedUserId = userId.Value.ToString("N");
 
             IReadOnlyList<string>? componentScripts = null;
+            string? componentBundleKey = null;
             try
             {
-                componentScripts = Services.ClientScriptBundle.GetComponentScripts();
+                // Only the modules of the features this server has enabled, under a key of
+                // their own (see Services/ClientScriptBundle.GetBundleKey).
+                componentScripts = Services.ClientScriptBundle.GetComponentScripts(ConfigFlags(config));
+                componentBundleKey = Services.ClientScriptBundle.GetBundleKey(JellyfinEnhanced.Instance!.ScriptCacheKey, componentScripts);
             }
             catch (Exception ex)
             {
@@ -3966,6 +3970,7 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Controllers
                     HiddenContent = TryLoadUserDocument("hidden-content.json", authorizedUserId, () => LoadUserHiddenContentDocument(authorizedUserId)),
                 },
                 ComponentScripts = componentScripts,
+                ComponentBundleKey = componentBundleKey,
                 Prefetched = BuildBootstrapPrefetched(config, userId.Value, authorizedUserId, isAdmin),
             });
         }
@@ -4093,9 +4098,27 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Controllers
 
             var devMode = plugin.Configuration?.DevMode == true;
             byte[] script, sourceMap;
+            var cacheable = true;
             try
             {
-                (script, sourceMap) = Services.ClientScriptBundle.GetBundle(plugin.ScriptCacheKey, rebuild: devMode, _logger);
+                // ?v= the configuration's bundle key (from the bootstrap): that module set,
+                // kept for a year. Any other key, or none, gets every module, as before;
+                // kept only under the plugin's own key, so a client holding a stale
+                // configuration key never caches what it gets now.
+                var requested = Request.Query["v"].ToString();
+                var scripts = plugin.Configuration != null
+                    ? Services.ClientScriptBundle.GetComponentScripts(ConfigFlags(plugin.Configuration))
+                    : Services.ClientScriptBundle.GetComponentScripts();
+                var bundleKey = Services.ClientScriptBundle.GetBundleKey(plugin.ScriptCacheKey, scripts);
+                if (string.Equals(requested, bundleKey, StringComparison.Ordinal))
+                {
+                    (script, sourceMap) = Services.ClientScriptBundle.GetBundle(bundleKey, scripts, rebuild: devMode, _logger);
+                }
+                else
+                {
+                    (script, sourceMap) = Services.ClientScriptBundle.GetBundle(plugin.ScriptCacheKey, rebuild: devMode, _logger);
+                    cacheable = string.IsNullOrEmpty(requested) || string.Equals(requested, plugin.ScriptCacheKey, StringComparison.Ordinal);
+                }
             }
             catch (Exception ex)
             {
@@ -4104,10 +4127,33 @@ namespace Jellyfin.Plugin.JellyfinEnhanced.Controllers
                 return StatusCode(500);
             }
 
-            Response.Headers["Cache-Control"] = devMode ? "no-store" : "public, max-age=31536000, immutable";
+            Response.Headers["Cache-Control"] = devMode || !cacheable ? "no-store" : "public, max-age=31536000, immutable";
             return map
                 ? File(sourceMap, "application/json")
                 : File(script, "application/javascript");
+        }
+
+        /// <summary>
+        /// The configuration flags the module gates read (js/component-gates.json),
+        /// as the client sees them in PublicConfig (computed ones such as
+        /// TagStyleWebActive included), else the configuration property; a flag
+        /// neither knows counts as true so its modules ship.
+        /// </summary>
+        private Func<string, bool> ConfigFlags(PluginConfiguration config)
+        {
+            var publicConfig = System.Text.Json.JsonSerializer.SerializeToElement(BuildPublicConfig(config));
+            return name =>
+            {
+                if (publicConfig.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && publicConfig.TryGetProperty(name, out var value)
+                    && value.ValueKind is System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False)
+                {
+                    return value.ValueKind == System.Text.Json.JsonValueKind.True;
+                }
+
+                var property = typeof(PluginConfiguration).GetProperty(name);
+                return property?.PropertyType != typeof(bool) || (bool)property.GetValue(config)!;
+            };
         }
 
         [HttpGet("tmdb/{**apiPath}")]
